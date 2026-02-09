@@ -14,6 +14,8 @@ import {
   Settings,
   Brain,
   Search,
+  Calendar,
+  Tag,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -29,6 +31,8 @@ const navigation = [
 
 const management = [
   { name: "Goals", href: "/goals", icon: Target },
+  { name: "Events", href: "/events", icon: Calendar },
+  { name: "Promos", href: "/promos", icon: Tag },
   { name: "Decisions", href: "/decisions", icon: History },
   { name: "Team", href: "/team", icon: Users },
   { name: "Settings", href: "/settings", icon: Settings },

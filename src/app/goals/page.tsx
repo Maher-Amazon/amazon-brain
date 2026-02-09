@@ -40,6 +40,7 @@ export default function GoalsPage() {
   const [accountDefaults, setAccountDefaults] = useState({
     tacosTarget: 15,
     acosTarget: 25,
+    tacosHighThreshold: 25,
     minStockDays: 14,
   });
 
@@ -67,7 +68,7 @@ export default function GoalsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid gap-6 md:grid-cols-3">
+          <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
             <div className="space-y-2">
               <div className="flex items-center gap-2">
                 <Label htmlFor="default-tacos">Default TACoS Target (%)</Label>
@@ -91,6 +92,33 @@ export default function GoalsPage() {
                   setAccountDefaults({
                     ...accountDefaults,
                     tacosTarget: Number(e.target.value),
+                  })
+                }
+              />
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="tacos-high">TACoS High Threshold (%)</Label>
+                <Tooltip>
+                  <TooltipTrigger>
+                    <Info className="h-4 w-4 text-muted-foreground" />
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>TACoS above this is considered "high"</p>
+                    <p className="text-xs text-muted-foreground">
+                      Used for alerts and highlighting
+                    </p>
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+              <Input
+                id="tacos-high"
+                type="number"
+                value={accountDefaults.tacosHighThreshold}
+                onChange={(e) =>
+                  setAccountDefaults({
+                    ...accountDefaults,
+                    tacosHighThreshold: Number(e.target.value),
                   })
                 }
               />

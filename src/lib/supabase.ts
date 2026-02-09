@@ -3,7 +3,23 @@ import { createClient } from "@supabase/supabase-js";
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
+// Client-side Supabase client (respects RLS)
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// Server-side Supabase client (bypasses RLS for server components)
+export function getSupabaseServer() {
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!serviceRoleKey) {
+    console.warn("SUPABASE_SERVICE_ROLE_KEY not found, using anon key");
+    return supabase;
+  }
+  return createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+}
 
 export type Brand = {
   id: string;
@@ -112,9 +128,11 @@ export type EventUae = {
   name: string;
   start_date: string;
   end_date: string;
-  status: string;
+  status: "tbc" | "confirmed" | "cancelled";
   impact_level: "high" | "medium" | "low";
+  description: string | null;
   created_at: string;
+  updated_at: string;
 };
 
 export type GoalHistory = {
@@ -165,4 +183,52 @@ export type BrandSummary = Brand & {
   currentWeek: BrandWeek | null;
   previousWeek: BrandWeek | null;
   alerts: Alert[];
+};
+
+export type AccountSettings = {
+  id: string;
+  default_tacos_target: number;
+  default_acos_target: number;
+  default_min_stock_days: number;
+  tacos_high_threshold: number;
+  vat_rate: number;
+  currency: string;
+  timezone: string;
+  last_sync_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TargetAsinWeek = {
+  id: string;
+  target_asin: string;
+  campaign_id: string | null;
+  brand_id: string | null;
+  ad_type: "SP" | "SD";
+  week_start: string;
+  impressions: number;
+  clicks: number;
+  spend: number;
+  sales: number;
+  orders: number;
+  acos: number;
+  created_at: string;
+};
+
+export type PromoType = "discount" | "coupon" | "ped" | "deal" | "lightning_deal";
+export type PromoStatus = "active" | "ended" | "scheduled";
+
+export type PromosTracker = {
+  id: string;
+  asin: string;
+  sku_id: string | null;
+  promo_type: PromoType;
+  discount_percent: number | null;
+  discount_amount: number | null;
+  start_date: string;
+  end_date: string | null;
+  status: PromoStatus;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
 };

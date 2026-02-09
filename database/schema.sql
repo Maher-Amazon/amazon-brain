@@ -133,10 +133,45 @@ CREATE TABLE events_uae (
   name VARCHAR(255) NOT NULL,
   start_date DATE NOT NULL,
   end_date DATE NOT NULL,
-  status VARCHAR(50) NOT NULL DEFAULT 'upcoming',
+  status VARCHAR(50) NOT NULL DEFAULT 'tbc', -- 'tbc', 'confirmed', 'cancelled'
   impact_level VARCHAR(20) NOT NULL DEFAULT 'medium', -- 'high', 'medium', 'low'
   description TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Target ASIN weekly data (competitor/detail-page targeting)
+CREATE TABLE target_asin_week (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  target_asin VARCHAR(20) NOT NULL,
+  campaign_id UUID REFERENCES campaigns(id) ON DELETE SET NULL,
+  brand_id UUID REFERENCES brands(id) ON DELETE SET NULL,
+  ad_type VARCHAR(10) NOT NULL, -- 'SP' or 'SD'
+  week_start DATE NOT NULL,
+  impressions INTEGER NOT NULL DEFAULT 0,
+  clicks INTEGER NOT NULL DEFAULT 0,
+  spend DECIMAL(10,2) NOT NULL DEFAULT 0,
+  sales DECIMAL(12,2) NOT NULL DEFAULT 0,
+  orders INTEGER NOT NULL DEFAULT 0,
+  acos DECIMAL(5,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(target_asin, campaign_id, ad_type, week_start)
+);
+
+-- Promotions tracker
+CREATE TABLE promos_tracker (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  asin VARCHAR(20) NOT NULL,
+  sku_id UUID REFERENCES skus(id) ON DELETE SET NULL,
+  promo_type VARCHAR(50) NOT NULL, -- 'discount', 'coupon', 'ped', 'deal', 'lightning_deal'
+  discount_percent DECIMAL(5,2),
+  discount_amount DECIMAL(10,2),
+  start_date DATE NOT NULL,
+  end_date DATE,
+  status VARCHAR(50) NOT NULL DEFAULT 'active', -- 'active', 'ended', 'scheduled'
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Goals history tracking
@@ -181,6 +216,7 @@ CREATE TABLE account_settings (
   default_tacos_target DECIMAL(5,2) NOT NULL DEFAULT 15.00,
   default_acos_target DECIMAL(5,2) NOT NULL DEFAULT 25.00,
   default_min_stock_days INTEGER NOT NULL DEFAULT 14,
+  tacos_high_threshold DECIMAL(5,2) NOT NULL DEFAULT 25.00, -- TACoS above this is "high"
   vat_rate DECIMAL(4,2) NOT NULL DEFAULT 5.00,
   currency VARCHAR(10) NOT NULL DEFAULT 'AED',
   timezone VARCHAR(100) NOT NULL DEFAULT 'Asia/Dubai',
@@ -207,6 +243,14 @@ CREATE INDEX idx_decisions_entity ON decisions(entity_type, entity_id);
 CREATE INDEX idx_alerts_entity ON alerts(entity_type, entity_id);
 CREATE INDEX idx_alerts_level ON alerts(level);
 CREATE INDEX idx_alerts_resolved ON alerts(resolved_at);
+CREATE INDEX idx_target_asin_week_asin ON target_asin_week(target_asin);
+CREATE INDEX idx_target_asin_week_campaign ON target_asin_week(campaign_id);
+CREATE INDEX idx_target_asin_week_week ON target_asin_week(week_start);
+CREATE INDEX idx_promos_tracker_asin ON promos_tracker(asin);
+CREATE INDEX idx_promos_tracker_sku ON promos_tracker(sku_id);
+CREATE INDEX idx_promos_tracker_status ON promos_tracker(status);
+CREATE INDEX idx_promos_tracker_dates ON promos_tracker(start_date, end_date);
+CREATE INDEX idx_events_uae_dates ON events_uae(start_date, end_date);
 
 -- Create updated_at trigger function
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -233,6 +277,12 @@ CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 CREATE TRIGGER update_account_settings_updated_at BEFORE UPDATE ON account_settings
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+CREATE TRIGGER update_events_uae_updated_at BEFORE UPDATE ON events_uae
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_promos_tracker_updated_at BEFORE UPDATE ON promos_tracker
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- Row Level Security (RLS) policies
 ALTER TABLE brands ENABLE ROW LEVEL SECURITY;
 ALTER TABLE skus ENABLE ROW LEVEL SECURITY;
@@ -247,6 +297,8 @@ ALTER TABLE goals_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE account_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE target_asin_week ENABLE ROW LEVEL SECURITY;
+ALTER TABLE promos_tracker ENABLE ROW LEVEL SECURITY;
 
 -- Allow authenticated users to read all data
 CREATE POLICY "Allow authenticated read" ON brands FOR SELECT TO authenticated USING (true);
@@ -261,6 +313,8 @@ CREATE POLICY "Allow authenticated read" ON events_uae FOR SELECT TO authenticat
 CREATE POLICY "Allow authenticated read" ON goals_history FOR SELECT TO authenticated USING (true);
 CREATE POLICY "Allow authenticated read" ON alerts FOR SELECT TO authenticated USING (true);
 CREATE POLICY "Allow authenticated read" ON account_settings FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Allow authenticated read" ON target_asin_week FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Allow authenticated read" ON promos_tracker FOR SELECT TO authenticated USING (true);
 
 -- Users can read their own profile
 CREATE POLICY "Users can read own profile" ON users FOR SELECT TO authenticated USING (auth.uid() = id);
@@ -284,6 +338,12 @@ CREATE POLICY "Admins can manage goals_history" ON goals_history FOR ALL TO auth
   USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
 CREATE POLICY "Admins can manage account_settings" ON account_settings FOR ALL TO authenticated
   USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
+CREATE POLICY "Admins can manage target_asin_week" ON target_asin_week FOR ALL TO authenticated
+  USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
+CREATE POLICY "Admins can manage promos_tracker" ON promos_tracker FOR ALL TO authenticated
+  USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
+CREATE POLICY "Admins can manage events_uae" ON events_uae FOR ALL TO authenticated
+  USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
 
 -- Service role can do everything (for sync scripts)
 CREATE POLICY "Service role full access brands" ON brands FOR ALL TO service_role USING (true);
@@ -294,11 +354,14 @@ CREATE POLICY "Service role full access campaigns" ON campaigns FOR ALL TO servi
 CREATE POLICY "Service role full access campaign_week" ON campaign_week FOR ALL TO service_role USING (true);
 CREATE POLICY "Service role full access searchterm_week" ON searchterm_week FOR ALL TO service_role USING (true);
 CREATE POLICY "Service role full access alerts" ON alerts FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access target_asin_week" ON target_asin_week FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access promos_tracker" ON promos_tracker FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access events_uae" ON events_uae FOR ALL TO service_role USING (true);
 
 -- Insert sample UAE events
-INSERT INTO events_uae (name, start_date, end_date, impact_level, description) VALUES
-  ('Ramadan', '2024-03-10', '2024-04-09', 'high', 'Holy month - significant impact on buying patterns'),
-  ('Eid Al Fitr', '2024-04-10', '2024-04-13', 'high', 'End of Ramadan celebration'),
-  ('Dubai Summer Surprises', '2024-06-28', '2024-09-03', 'medium', 'Annual summer shopping festival'),
-  ('UAE National Day', '2024-12-02', '2024-12-03', 'medium', 'National holiday celebrations'),
-  ('White Friday', '2024-11-29', '2024-12-02', 'high', 'Black Friday equivalent - major sales event');
+INSERT INTO events_uae (name, start_date, end_date, status, impact_level, description) VALUES
+  ('Ramadan', '2025-02-28', '2025-03-29', 'confirmed', 'high', 'Holy month - significant impact on buying patterns'),
+  ('Eid Al Fitr', '2025-03-30', '2025-04-02', 'confirmed', 'high', 'End of Ramadan celebration'),
+  ('Dubai Summer Surprises', '2025-06-28', '2025-09-03', 'tbc', 'medium', 'Annual summer shopping festival'),
+  ('UAE National Day', '2025-12-02', '2025-12-03', 'confirmed', 'medium', 'National holiday celebrations'),
+  ('White Friday', '2025-11-28', '2025-12-01', 'tbc', 'high', 'Black Friday equivalent - major sales event');
