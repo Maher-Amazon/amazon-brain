@@ -174,6 +174,30 @@ CREATE TABLE promos_tracker (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Campaign flags (strategic annotations for Google Sheets)
+CREATE TABLE campaign_flags (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  flag VARCHAR(20) NOT NULL, -- 'DEFEND', 'AGGRESS', 'TEST', 'PAUSE', 'SCALE'
+  reason TEXT,
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(campaign_id) -- One active flag per campaign
+);
+
+-- Weekly notes (manual commentary per week)
+CREATE TABLE weekly_notes (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  week_start DATE NOT NULL,
+  brand_id UUID REFERENCES brands(id) ON DELETE SET NULL, -- NULL = account-level note
+  note TEXT NOT NULL,
+  category VARCHAR(50) NOT NULL DEFAULT 'general', -- 'general', 'ads', 'inventory', 'promo', 'event'
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Goals history tracking
 CREATE TABLE goals_history (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -251,6 +275,10 @@ CREATE INDEX idx_promos_tracker_sku ON promos_tracker(sku_id);
 CREATE INDEX idx_promos_tracker_status ON promos_tracker(status);
 CREATE INDEX idx_promos_tracker_dates ON promos_tracker(start_date, end_date);
 CREATE INDEX idx_events_uae_dates ON events_uae(start_date, end_date);
+CREATE INDEX idx_campaign_flags_campaign ON campaign_flags(campaign_id);
+CREATE INDEX idx_campaign_flags_flag ON campaign_flags(flag);
+CREATE INDEX idx_weekly_notes_week ON weekly_notes(week_start);
+CREATE INDEX idx_weekly_notes_brand ON weekly_notes(brand_id);
 
 -- Create updated_at trigger function
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -283,6 +311,12 @@ CREATE TRIGGER update_events_uae_updated_at BEFORE UPDATE ON events_uae
 CREATE TRIGGER update_promos_tracker_updated_at BEFORE UPDATE ON promos_tracker
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+CREATE TRIGGER update_campaign_flags_updated_at BEFORE UPDATE ON campaign_flags
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_weekly_notes_updated_at BEFORE UPDATE ON weekly_notes
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- Row Level Security (RLS) policies
 ALTER TABLE brands ENABLE ROW LEVEL SECURITY;
 ALTER TABLE skus ENABLE ROW LEVEL SECURITY;
@@ -299,6 +333,8 @@ ALTER TABLE alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE account_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE target_asin_week ENABLE ROW LEVEL SECURITY;
 ALTER TABLE promos_tracker ENABLE ROW LEVEL SECURITY;
+ALTER TABLE campaign_flags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE weekly_notes ENABLE ROW LEVEL SECURITY;
 
 -- Allow authenticated users to read all data
 CREATE POLICY "Allow authenticated read" ON brands FOR SELECT TO authenticated USING (true);
@@ -315,6 +351,8 @@ CREATE POLICY "Allow authenticated read" ON alerts FOR SELECT TO authenticated U
 CREATE POLICY "Allow authenticated read" ON account_settings FOR SELECT TO authenticated USING (true);
 CREATE POLICY "Allow authenticated read" ON target_asin_week FOR SELECT TO authenticated USING (true);
 CREATE POLICY "Allow authenticated read" ON promos_tracker FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Allow authenticated read" ON campaign_flags FOR SELECT TO authenticated USING (true);
+CREATE POLICY "Allow authenticated read" ON weekly_notes FOR SELECT TO authenticated USING (true);
 
 -- Users can read their own profile
 CREATE POLICY "Users can read own profile" ON users FOR SELECT TO authenticated USING (auth.uid() = id);
@@ -344,6 +382,10 @@ CREATE POLICY "Admins can manage promos_tracker" ON promos_tracker FOR ALL TO au
   USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
 CREATE POLICY "Admins can manage events_uae" ON events_uae FOR ALL TO authenticated
   USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
+CREATE POLICY "Admins can manage campaign_flags" ON campaign_flags FOR ALL TO authenticated
+  USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
+CREATE POLICY "Admins can manage weekly_notes" ON weekly_notes FOR ALL TO authenticated
+  USING (EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin'));
 
 -- Service role can do everything (for sync scripts)
 CREATE POLICY "Service role full access brands" ON brands FOR ALL TO service_role USING (true);
@@ -357,6 +399,8 @@ CREATE POLICY "Service role full access alerts" ON alerts FOR ALL TO service_rol
 CREATE POLICY "Service role full access target_asin_week" ON target_asin_week FOR ALL TO service_role USING (true);
 CREATE POLICY "Service role full access promos_tracker" ON promos_tracker FOR ALL TO service_role USING (true);
 CREATE POLICY "Service role full access events_uae" ON events_uae FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access campaign_flags" ON campaign_flags FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access weekly_notes" ON weekly_notes FOR ALL TO service_role USING (true);
 
 -- Insert sample UAE events
 INSERT INTO events_uae (name, start_date, end_date, status, impact_level, description) VALUES

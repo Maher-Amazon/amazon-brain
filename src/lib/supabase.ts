@@ -232,3 +232,28 @@ export type PromosTracker = {
   created_at: string;
   updated_at: string;
 };
+
+export type CampaignFlagType = "DEFEND" | "AGGRESS" | "TEST" | "PAUSE" | "SCALE";
+
+export type CampaignFlag = {
+  id: string;
+  campaign_id: string;
+  flag: CampaignFlagType;
+  reason: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WeeklyNoteCategory = "general" | "ads" | "inventory" | "promo" | "event";
+
+export type WeeklyNote = {
+  id: string;
+  week_start: string;
+  brand_id: string | null;
+  note: string;
+  category: WeeklyNoteCategory;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
