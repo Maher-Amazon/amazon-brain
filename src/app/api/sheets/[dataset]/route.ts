@@ -21,6 +21,7 @@ function getWeekRange(request: NextRequest): { weeks: number; startDate?: string
 }
 
 // Dataset handlers
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function getCampaignWeek(supabase: ReturnType<typeof getSupabaseServer>, weeks: number) {
   const { data, error } = await supabase
     .from("campaign_week")
@@ -44,11 +45,12 @@ async function getCampaignWeek(supabase: ReturnType<typeof getSupabaseServer>, w
       )
     `)
     .order("week_start", { ascending: false })
-    .limit(weeks * 100); // Approximate limit
+    .limit(weeks * 100);
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     week_start: row.week_start,
     campaign_id: row.campaigns.campaign_id,
     campaign_name: row.campaigns.name,
@@ -87,7 +89,8 @@ async function getSearchTermWeek(supabase: ReturnType<typeof getSupabaseServer>,
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     week_start: row.week_start,
     term: row.term,
     brand_name: row.brands?.name || "",
@@ -124,7 +127,8 @@ async function getTargetAsinWeek(supabase: ReturnType<typeof getSupabaseServer>,
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     week_start: row.week_start,
     target_asin: row.target_asin,
     ad_type: row.ad_type,
@@ -166,7 +170,8 @@ async function getAsinWeek(supabase: ReturnType<typeof getSupabaseServer>, weeks
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     week_start: row.week_start,
     asin: row.skus.asin,
     sku: row.skus.sku,
@@ -207,7 +212,8 @@ async function getBrandWeek(supabase: ReturnType<typeof getSupabaseServer>, week
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     week_start: row.week_start,
     brand_name: row.brands.name,
     mode: row.brands.mode,
@@ -263,7 +269,8 @@ async function getCampaigns(supabase: ReturnType<typeof getSupabaseServer>) {
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     id: row.id,
     campaign_id: row.campaign_id,
     name: row.name,
@@ -289,7 +296,8 @@ async function getCampaignFlags(supabase: ReturnType<typeof getSupabaseServer>) 
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     campaign_id: row.campaigns.campaign_id,
     campaign_name: row.campaigns.name,
     flag: row.flag,
@@ -327,7 +335,8 @@ async function getPromos(supabase: ReturnType<typeof getSupabaseServer>) {
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     asin: row.asin,
     sku: row.skus?.sku || "",
     title: row.skus?.title || "",
@@ -358,7 +367,8 @@ async function getWeeklyNotes(supabase: ReturnType<typeof getSupabaseServer>, we
 
   if (error) throw error;
 
-  return data?.map((row) => ({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (data as any[])?.map((row: any) => ({
     week_start: row.week_start,
     brand_name: row.brands?.name || "Account",
     note: row.note,
