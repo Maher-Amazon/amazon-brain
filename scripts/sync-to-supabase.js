@@ -5,12 +5,19 @@
  * Run with: node scripts/sync-to-supabase.js
  *
  * Options:
- *   --orders    Sync orders data
- *   --ads       Sync advertising data (SP + SD campaigns)
- *   --targeting Sync target ASIN data (competitor/detail-page targeting)
- *   --inventory Sync inventory data (deprecated, use --products)
- *   --products  Sync products/SKUs with brand extraction
- *   --all       Sync everything
+ *   --orders      Sync orders data
+ *   --ads         Sync advertising data (SP + SD campaigns)
+ *   --targeting   Sync target ASIN data (competitor/detail-page targeting)
+ *   --searchterms Sync search term report data
+ *   --inventory   Sync inventory data (deprecated, use --products)
+ *   --products    Sync products/SKUs with brand extraction
+ *   --all         Sync everything
+ *   --days=N      Number of days to sync (default: 90, max 60 for ads data)
+ *
+ * Examples:
+ *   node scripts/sync-to-supabase.js --all --days=90
+ *   node scripts/sync-to-supabase.js --orders --days=30
+ *   SYNC_DAYS_BACK=90 node scripts/sync-to-supabase.js --all
  */
 
 require('dotenv').config({ path: '.env.local' });
@@ -34,6 +41,13 @@ const syncAds = syncAll || args.includes('--ads');
 const syncTargeting = syncAll || args.includes('--targeting');
 const syncInventory = args.includes('--inventory'); // deprecated
 const syncProducts = syncAll || args.includes('--products');
+const syncSearchTerms = syncAll || args.includes('--searchterms');
+
+// Parse --days=N argument (default to env var or 90 days)
+const daysArg = args.find(a => a.startsWith('--days='));
+const syncDaysBack = daysArg
+  ? parseInt(daysArg.split('=')[1], 10)
+  : parseInt(process.env.SYNC_DAYS_BACK || '90', 10);
 
 // Cache for brand lookups (ASIN -> brand name)
 const brandCache = {};
@@ -299,36 +313,65 @@ async function syncProductsData() {
 // Sync orders using SP-API with real brand mapping
 async function syncOrdersData() {
   console.log('\n=== Syncing Orders ===\n');
+  console.log(`Fetching orders from the last ${syncDaysBack} days...`);
 
   try {
     const sp = createSpClient();
 
-    // Get orders from the last 7 days
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    // Get orders from the configured date range
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - syncDaysBack);
 
-    const orders = await sp.callAPI({
-      operation: 'getOrders',
-      endpoint: 'orders',
-      query: {
+    // Fetch all orders with pagination
+    let allOrders = [];
+    let nextToken = null;
+
+    do {
+      const query = {
         MarketplaceIds: [process.env.MARKETPLACE_ID],
-        CreatedAfter: sevenDaysAgo.toISOString(),
+        CreatedAfter: startDate.toISOString(),
         OrderStatuses: ['Shipped', 'Unshipped', 'PartiallyShipped'],
-      },
-    });
+      };
 
-    console.log(`Found ${orders.Orders?.length || 0} orders`);
+      if (nextToken) {
+        query.NextToken = nextToken;
+      }
 
-    const weekStart = getWeekStart(new Date()).toISOString().split('T')[0];
-    const brandAggregates = {}; // brandId -> { revenue, units, orders }
-    const skuAggregates = {}; // skuId -> { revenue, units, orders }
+      const response = await sp.callAPI({
+        operation: 'getOrders',
+        endpoint: 'orders',
+        query,
+      });
+
+      const orders = response.Orders || [];
+      allOrders = allOrders.concat(orders);
+      nextToken = response.NextToken;
+
+      if (nextToken) {
+        console.log(`  Fetched ${allOrders.length} orders so far, getting more...`);
+      }
+    } while (nextToken);
+
+    const orders = { Orders: allOrders };
+    console.log(`Found ${orders.Orders?.length || 0} orders total`);
+
+    // Aggregates by week: { weekStart -> { brandId -> { revenue, units, orders } } }
+    const brandWeekAggregates = {};
+    // Aggregates by week: { weekStart -> { skuId -> { revenue, units } } }
+    const skuWeekAggregates = {};
 
     // Collect all SKUs from order items to batch lookup brands
     const allSkus = new Set();
     const orderItemsMap = {}; // orderId -> items
+    const orderDatesMap = {}; // orderId -> purchaseDate
 
     // First pass: get all order items and collect SKUs
+    const totalOrders = (orders.Orders || []).length;
+    let processedOrders = 0;
+    console.log(`Fetching order items for ${totalOrders} orders (this may take a while)...`);
+
     for (const order of orders.Orders || []) {
+      orderDatesMap[order.AmazonOrderId] = order.PurchaseDate;
       try {
         const itemsRes = await sp.callAPI({
           operation: 'getOrderItems',
@@ -343,6 +386,11 @@ async function syncOrdersData() {
         console.error(`Error getting items for order ${order.AmazonOrderId}:`, e.message);
         orderItemsMap[order.AmazonOrderId] = [];
       }
+
+      processedOrders++;
+      if (processedOrders % 100 === 0 || processedOrders === totalOrders) {
+        console.log(`  Processed order items: ${processedOrders}/${totalOrders}`);
+      }
     }
 
     // Lookup brands for all SKUs (uses cache populated by syncProductsData if run first)
@@ -354,9 +402,11 @@ async function syncOrdersData() {
       }
     }
 
-    // Second pass: aggregate by brand
+    // Second pass: aggregate by brand and week
     for (const order of orders.Orders || []) {
       const orderItems = orderItemsMap[order.AmazonOrderId] || [];
+      const orderDate = new Date(orderDatesMap[order.AmazonOrderId] || new Date());
+      const weekStart = getWeekStart(orderDate).toISOString().split('T')[0];
 
       for (const item of orderItems) {
         const asin = item.ASIN || '';
@@ -371,69 +421,93 @@ async function syncOrdersData() {
 
         if (!brandId) continue;
 
-        // Aggregate by brand
-        if (!brandAggregates[brandId]) {
-          brandAggregates[brandId] = { revenue: 0, units: 0, orders: new Set() };
+        // Initialize week aggregates if needed
+        if (!brandWeekAggregates[weekStart]) {
+          brandWeekAggregates[weekStart] = {};
         }
-        brandAggregates[brandId].revenue += itemPrice;
-        brandAggregates[brandId].units += quantity;
-        brandAggregates[brandId].orders.add(order.AmazonOrderId);
+        if (!brandWeekAggregates[weekStart][brandId]) {
+          brandWeekAggregates[weekStart][brandId] = { revenue: 0, units: 0, orders: new Set() };
+        }
+        brandWeekAggregates[weekStart][brandId].revenue += itemPrice;
+        brandWeekAggregates[weekStart][brandId].units += quantity;
+        brandWeekAggregates[weekStart][brandId].orders.add(order.AmazonOrderId);
 
-        // Create/update SKU and aggregate
+        // Create/update SKU and aggregate by week
         if (sku) {
           const skuId = await getOrCreateSku(sku, asin, title, brandId);
           if (skuId) {
-            if (!skuAggregates[skuId]) {
-              skuAggregates[skuId] = { revenue: 0, units: 0, orders: 0 };
+            if (!skuWeekAggregates[weekStart]) {
+              skuWeekAggregates[weekStart] = {};
             }
-            skuAggregates[skuId].revenue += itemPrice;
-            skuAggregates[skuId].units += quantity;
-            skuAggregates[skuId].orders += 1;
+            if (!skuWeekAggregates[weekStart][skuId]) {
+              skuWeekAggregates[weekStart][skuId] = { revenue: 0, units: 0 };
+            }
+            skuWeekAggregates[weekStart][skuId].revenue += itemPrice;
+            skuWeekAggregates[weekStart][skuId].units += quantity;
           }
         }
       }
     }
 
-    // Upsert brand weekly data
-    for (const [brandId, agg] of Object.entries(brandAggregates)) {
-      const revenueExVat = removeVat(agg.revenue);
+    // Upsert brand weekly data for each week
+    const weeksProcessed = Object.keys(brandWeekAggregates);
+    console.log(`Processing ${weeksProcessed.length} week(s) of brand data...`);
 
-      const { error } = await supabase.from('brand_week').upsert({
-        brand_id: brandId,
-        week_start: weekStart,
-        revenue: agg.revenue,
-        revenue_ex_vat: revenueExVat,
-        units: agg.units,
-        orders: agg.orders.size, // Convert Set to count
-      }, { onConflict: 'brand_id,week_start' });
+    for (const [weekStart, brands] of Object.entries(brandWeekAggregates)) {
+      for (const [brandId, agg] of Object.entries(brands)) {
+        const revenueExVat = removeVat(agg.revenue);
 
-      if (error) {
-        console.error('Error upserting brand week:', error);
+        const { error } = await supabase.from('brand_week').upsert({
+          brand_id: brandId,
+          week_start: weekStart,
+          revenue: agg.revenue,
+          revenue_ex_vat: revenueExVat,
+          units: agg.units,
+          orders: agg.orders.size,
+        }, { onConflict: 'brand_id,week_start' });
+
+        if (error) {
+          console.error('Error upserting brand week:', error);
+        }
       }
     }
 
-    // Upsert SKU weekly data (note: sku_week doesn't have 'orders' column)
-    for (const [skuId, agg] of Object.entries(skuAggregates)) {
-      const { error } = await supabase.from('sku_week').upsert({
-        sku_id: skuId,
-        week_start: weekStart,
-        revenue: agg.revenue,
-        units: agg.units,
-      }, { onConflict: 'sku_id,week_start' });
+    // Upsert SKU weekly data for each week
+    for (const [weekStart, skus] of Object.entries(skuWeekAggregates)) {
+      for (const [skuId, agg] of Object.entries(skus)) {
+        const { error } = await supabase.from('sku_week').upsert({
+          sku_id: skuId,
+          week_start: weekStart,
+          revenue: agg.revenue,
+          units: agg.units,
+        }, { onConflict: 'sku_id,week_start' });
 
-      if (error) {
-        console.error('Error upserting SKU week:', error);
+        if (error) {
+          console.error('Error upserting SKU week:', error);
+        }
       }
     }
 
+    // Get unique brands across all weeks
+    const allBrandIds = new Set();
+    for (const brands of Object.values(brandWeekAggregates)) {
+      Object.keys(brands).forEach(id => allBrandIds.add(id));
+    }
     const brandNames = await Promise.all(
-      Object.keys(brandAggregates).map(async id => {
+      [...allBrandIds].map(async id => {
         const { data } = await supabase.from('brands').select('name').eq('id', id).single();
         return data?.name || id;
       })
     );
-    console.log(`Synced orders for ${Object.keys(brandAggregates).length} brand(s): ${brandNames.join(', ')}`);
-    console.log(`Updated ${Object.keys(skuAggregates).length} SKU(s) with order data`);
+
+    // Count total SKUs across all weeks
+    const allSkuIds = new Set();
+    for (const skus of Object.values(skuWeekAggregates)) {
+      Object.keys(skus).forEach(id => allSkuIds.add(id));
+    }
+
+    console.log(`Synced ${weeksProcessed.length} week(s) of orders for ${allBrandIds.size} brand(s): ${brandNames.join(', ')}`);
+    console.log(`Updated ${allSkuIds.size} SKU(s) with order data`);
   } catch (error) {
     console.error('Error syncing orders:', error.message);
   }
@@ -604,13 +678,26 @@ async function syncAdsData() {
 
     const allCampaigns = [...spCampaigns, ...sdCampaigns];
 
-    // Store campaigns
-    const brandId = await getOrCreateBrand('Default');
+    // Store campaigns - preserve existing brand assignments
+    const defaultBrandId = await getOrCreateBrand('Default');
+
+    // Get existing campaigns to preserve brand assignments
+    const { data: existingCampaigns } = await supabase
+      .from('campaigns')
+      .select('campaign_id, brand_id');
+
+    const existingBrandMap = {};
+    for (const c of existingCampaigns || []) {
+      existingBrandMap[c.campaign_id] = c.brand_id;
+    }
 
     for (const campaign of allCampaigns) {
+      // Preserve existing brand_id if set, otherwise use default
+      const campaignBrandId = existingBrandMap[campaign.campaignId] || defaultBrandId;
+
       const { error } = await supabase.from('campaigns').upsert({
         campaign_id: campaign.campaignId,
-        brand_id: brandId,
+        brand_id: campaignBrandId,
         name: campaign.name,
         type: campaign.adType, // 'SP' or 'SD'
         state: campaign.state,
@@ -624,9 +711,228 @@ async function syncAdsData() {
     }
 
     console.log(`Synced ${allCampaigns.length} total campaigns (SP: ${spCampaigns.length}, SD: ${sdCampaigns.length})`);
+
+    // Now fetch campaign performance data and aggregate to brand_week
+    await syncCampaignPerformance(accessToken, profileId);
   } catch (error) {
     console.error('Error syncing ads:', error.message);
   }
+}
+
+// Sync campaign performance data and aggregate to brand_week
+async function syncCampaignPerformance(accessToken, profileId) {
+  console.log('\nFetching campaign performance data...');
+
+  // Use 14-day chunks for faster report generation (31 days often times out)
+  const maxAdsDays = Math.min(syncDaysBack, 60);
+  const chunkSize = 7; // Reduced from 14 to minimize report generation time
+
+  let allPerformanceData = [];
+
+  // Fetch in 31-day chunks
+  for (let daysBack = 0; daysBack < maxAdsDays; daysBack += chunkSize) {
+    const chunkEnd = new Date();
+    chunkEnd.setDate(chunkEnd.getDate() - daysBack);
+
+    const chunkStart = new Date();
+    chunkStart.setDate(chunkStart.getDate() - Math.min(daysBack + chunkSize, maxAdsDays));
+
+    if (chunkStart >= chunkEnd) break;
+
+    console.log(`  Requesting performance data: ${chunkStart.toISOString().split('T')[0]} to ${chunkEnd.toISOString().split('T')[0]}`);
+
+    const chunkData = await fetchCampaignPerformanceReport(accessToken, profileId, chunkStart, chunkEnd);
+    allPerformanceData = allPerformanceData.concat(chunkData);
+  }
+
+  console.log(`Found ${allPerformanceData.length} campaign performance records`);
+
+  if (allPerformanceData.length === 0) {
+    console.log('No campaign performance data to aggregate');
+    return;
+  }
+
+  // Get campaign -> brand mapping from database
+  const { data: campaigns } = await supabase
+    .from('campaigns')
+    .select('campaign_id, brand_id');
+
+  const campaignBrandMap = {};
+  for (const c of campaigns || []) {
+    campaignBrandMap[c.campaign_id] = c.brand_id;
+  }
+
+  // Aggregate by brand and week
+  const brandWeekAggregates = {}; // { `${brandId}-${weekStart}` -> { spend, sales, impressions, clicks } }
+
+  // Debug: log first few records and mapping
+  console.log('Sample performance records:');
+  for (let i = 0; i < Math.min(3, allPerformanceData.length); i++) {
+    const r = allPerformanceData[i];
+    console.log(`  campaignId: ${r.campaignId} (type: ${typeof r.campaignId}), spend: ${r.spend}, sales: ${r.sales}`);
+  }
+  console.log(`Campaign-brand map has ${Object.keys(campaignBrandMap).length} entries`);
+
+  let unmappedCount = 0;
+  for (const record of allPerformanceData) {
+    const brandId = campaignBrandMap[record.campaignId] || campaignBrandMap[String(record.campaignId)];
+    if (!brandId) {
+      unmappedCount++;
+      if (unmappedCount <= 3) {
+        console.log(`  Unmapped campaign: ${record.campaignId}`);
+      }
+      continue;
+    }
+
+    const recordDate = record.date ? new Date(record.date) : new Date();
+    const weekStart = getWeekStart(recordDate).toISOString().split('T')[0];
+    const key = `${brandId}-${weekStart}`;
+
+    if (!brandWeekAggregates[key]) {
+      brandWeekAggregates[key] = {
+        brand_id: brandId,
+        week_start: weekStart,
+        ad_spend: 0,
+        ad_sales: 0,
+        impressions: 0,
+        clicks: 0,
+      };
+    }
+
+    brandWeekAggregates[key].ad_spend += record.spend || 0;
+    brandWeekAggregates[key].ad_sales += record.sales || 0;
+    brandWeekAggregates[key].impressions += record.impressions || 0;
+    brandWeekAggregates[key].clicks += record.clicks || 0;
+  }
+
+  console.log(`Total unmapped campaigns: ${unmappedCount}`);
+
+  // Update brand_week with ad metrics
+  const aggregates = Object.values(brandWeekAggregates);
+  console.log(`Updating ${aggregates.length} brand-week records with ad metrics...`);
+
+  for (const agg of aggregates) {
+    console.log(`  Processing: brand_id=${agg.brand_id}, week_start=${agg.week_start}, ad_spend=${agg.ad_spend}, ad_sales=${agg.ad_sales}`);
+
+    // First get the existing brand_week record to calculate TACoS
+    const { data: existing, error: selectError } = await supabase
+      .from('brand_week')
+      .select('id, revenue')
+      .eq('brand_id', agg.brand_id)
+      .eq('week_start', agg.week_start)
+      .single();
+
+    if (selectError) {
+      console.log(`    No existing record found: ${selectError.message}`);
+      continue;
+    }
+
+    console.log(`    Found existing record id=${existing.id}, revenue=${existing.revenue}`);
+
+    const revenue = existing?.revenue || 0;
+    const tacos = revenue > 0 ? (agg.ad_spend / revenue) * 100 : 0;
+    const acos = agg.ad_sales > 0 ? (agg.ad_spend / agg.ad_sales) * 100 : 0;
+
+    const { error, count } = await supabase
+      .from('brand_week')
+      .update({
+        ad_spend: agg.ad_spend,
+        ad_sales: agg.ad_sales,
+        impressions: agg.impressions,
+        clicks: agg.clicks,
+        tacos: tacos,
+        acos: acos,
+      })
+      .eq('brand_id', agg.brand_id)
+      .eq('week_start', agg.week_start);
+
+    if (error) {
+      console.error('    Error updating brand_week with ad metrics:', error);
+    } else {
+      console.log(`    Updated successfully`);
+    }
+  }
+
+  console.log(`Updated ${aggregates.length} brand-week records with ad performance data`);
+}
+
+// Fetch campaign performance report from Ads API
+async function fetchCampaignPerformanceReport(accessToken, profileId, startDate, endDate) {
+  const https = require('https');
+
+  const formatDate = (d) => d.toISOString().split('T')[0];
+
+  // Request SP campaign report using v3 reporting API
+  const reportRequest = {
+    name: 'SP Campaign Performance Report',
+    startDate: formatDate(startDate),
+    endDate: formatDate(endDate),
+    configuration: {
+      adProduct: 'SPONSORED_PRODUCTS',
+      groupBy: ['campaign'],
+      columns: [
+        'date',
+        'campaignId',
+        'campaignName',
+        'impressions',
+        'clicks',
+        'cost',
+        'sales14d',
+      ],
+      reportTypeId: 'spCampaigns',
+      timeUnit: 'DAILY',
+      format: 'GZIP_JSON',
+    },
+  };
+
+  const reportResponse = await new Promise((resolve, reject) => {
+    const postData = JSON.stringify(reportRequest);
+    const req = https.request({
+      hostname: 'advertising-api-eu.amazon.com',
+      path: '/reporting/reports',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Amazon-Advertising-API-ClientId': process.env.ADS_CLIENT_ID || process.env.LWA_CLIENT_ID,
+        'Amazon-Advertising-API-Scope': profileId,
+        'Content-Type': 'application/vnd.createasyncreportrequest.v3+json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          resolve({ reportId: null });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+
+  if (!reportResponse.reportId) {
+    console.log('    No campaign performance report ID returned');
+    return [];
+  }
+
+  console.log(`    Report ID: ${reportResponse.reportId}, polling for completion...`);
+
+  // Poll for report completion using v3 API with extended timeout for performance reports
+  const reportData = await downloadReportV3(accessToken, profileId, reportResponse.reportId, 90);
+
+  // Transform to our format
+  return reportData.map(r => ({
+    date: r.date,
+    campaignId: r.campaignId,
+    impressions: r.impressions || 0,
+    clicks: r.clicks || 0,
+    spend: r.cost || 0,
+    sales: r.sales14d || 0,
+  }));
 }
 
 // Sync target ASIN data (competitor/detail-page targeting)
@@ -734,6 +1040,315 @@ async function syncTargetingData() {
   } catch (error) {
     console.error('Error syncing targeting data:', error.message);
   }
+}
+
+// Sync search term data from SP Search Term Report
+async function syncSearchTermsData() {
+  console.log('\n=== Syncing Search Terms ===\n');
+
+  try {
+    const accessToken = await getAdsAccessToken();
+    if (!accessToken) {
+      console.error('Failed to get access token');
+      return;
+    }
+
+    const profileId = await getAdsProfileId(accessToken);
+    if (!profileId) {
+      console.log('No advertising profiles found');
+      return;
+    }
+
+    // Amazon Ads API allows up to 31 days per request for search term reports
+    const maxAdsDays = Math.min(syncDaysBack, 60); // Still aim for 60 days max
+    console.log(`Fetching search term data for the last ${maxAdsDays} days (31-day chunks)...`);
+
+    // Fetch in 31-day chunks (API limit)
+    const chunkSize = 31;
+    let allSearchTermData = [];
+    const endDate = new Date();
+
+    for (let daysBack = 0; daysBack < maxAdsDays; daysBack += chunkSize) {
+      const chunkEnd = new Date();
+      chunkEnd.setDate(chunkEnd.getDate() - daysBack);
+
+      const chunkStart = new Date();
+      chunkStart.setDate(chunkStart.getDate() - Math.min(daysBack + chunkSize, maxAdsDays));
+
+      if (chunkStart >= chunkEnd) break;
+
+      console.log(`  Requesting chunk: ${chunkStart.toISOString().split('T')[0]} to ${chunkEnd.toISOString().split('T')[0]}`);
+
+      const chunkData = await fetchSpSearchTermReport(accessToken, profileId, chunkStart, chunkEnd);
+      allSearchTermData = allSearchTermData.concat(chunkData);
+    }
+
+    const searchTermData = allSearchTermData;
+    console.log(`Found ${searchTermData.length} search term records total`);
+
+    if (searchTermData.length === 0) {
+      console.log('No search term data to sync');
+      return;
+    }
+
+    // Aggregate by week and search term
+    const weekAggregates = {}; // { weekStart -> { query -> { ... } } }
+
+    for (const record of searchTermData) {
+      // Parse the date from the record (if available) or use report date
+      const recordDate = record.date ? new Date(record.date) : new Date();
+      const weekStart = getWeekStart(recordDate).toISOString().split('T')[0];
+
+      if (!weekAggregates[weekStart]) {
+        weekAggregates[weekStart] = {};
+      }
+
+      const query = record.query || '';
+      if (!query) continue;
+
+      // Create a unique key for this search term + campaign combination
+      const key = `${query}|${record.campaignId || 'unknown'}`;
+
+      if (!weekAggregates[weekStart][key]) {
+        weekAggregates[weekStart][key] = {
+          query,
+          campaignId: record.campaignId,
+          impressions: 0,
+          clicks: 0,
+          spend: 0,
+          sales: 0,
+          orders: 0,
+        };
+      }
+
+      weekAggregates[weekStart][key].impressions += record.impressions || 0;
+      weekAggregates[weekStart][key].clicks += record.clicks || 0;
+      weekAggregates[weekStart][key].spend += record.spend || 0;
+      weekAggregates[weekStart][key].sales += record.sales || 0;
+      weekAggregates[weekStart][key].orders += record.orders || 0;
+    }
+
+    // Get default brand for now (search terms can be linked to campaigns which have brands)
+    const defaultBrandId = await getOrCreateBrand('Default');
+
+    // Upsert aggregated data
+    let upserted = 0;
+    const weeksProcessed = Object.keys(weekAggregates);
+    console.log(`Processing ${weeksProcessed.length} week(s) of search term data...`);
+
+    for (const [weekStart, terms] of Object.entries(weekAggregates)) {
+      for (const [, data] of Object.entries(terms)) {
+        // Look up campaign in our database
+        let campaignId = null;
+        let brandId = defaultBrandId;
+
+        if (data.campaignId) {
+          const { data: campaign } = await supabase
+            .from('campaigns')
+            .select('id, brand_id')
+            .eq('campaign_id', data.campaignId)
+            .single();
+
+          if (campaign) {
+            campaignId = campaign.id;
+            brandId = campaign.brand_id || defaultBrandId;
+          }
+        }
+
+        const acos = data.sales > 0 ? (data.spend / data.sales) * 100 : 0;
+
+        const { error } = await supabase.from('searchterm_week').upsert({
+          term: data.query,
+          campaign_id: campaignId,
+          brand_id: brandId,
+          week_start: weekStart,
+          impressions: data.impressions,
+          clicks: data.clicks,
+          spend: data.spend,
+          sales: data.sales,
+          orders: data.orders,
+          acos: acos,
+        }, { onConflict: 'term,campaign_id,week_start' });
+
+        if (error) {
+          console.error('Error upserting search term:', error);
+        } else {
+          upserted++;
+        }
+      }
+    }
+
+    console.log(`Synced ${upserted} search term records across ${weeksProcessed.length} week(s)`);
+  } catch (error) {
+    console.error('Error syncing search terms:', error.message);
+  }
+}
+
+// Fetch SP Search Term Report
+async function fetchSpSearchTermReport(accessToken, profileId, startDate, endDate) {
+  const https = require('https');
+
+  // Format dates as YYYY-MM-DD for the v3 API
+  const formatDate = (d) => d.toISOString().split('T')[0];
+
+  // Request the search term report using the v3 reporting API
+  const reportRequest = {
+    name: 'SP Search Term Report',
+    startDate: formatDate(startDate),
+    endDate: formatDate(endDate),
+    configuration: {
+      adProduct: 'SPONSORED_PRODUCTS',
+      groupBy: ['searchTerm'],
+      columns: [
+        'date',
+        'campaignId',
+        'campaignName',
+        'adGroupId',
+        'adGroupName',
+        'searchTerm',
+        'impressions',
+        'clicks',
+        'cost',
+        'sales14d',
+        'purchases14d',
+      ],
+      reportTypeId: 'spSearchTerm',
+      timeUnit: 'DAILY',
+      format: 'GZIP_JSON',
+    },
+  };
+
+  console.log('Requesting search term report...');
+
+  const reportResponse = await new Promise((resolve, reject) => {
+    const postData = JSON.stringify(reportRequest);
+    const req = https.request({
+      hostname: 'advertising-api-eu.amazon.com',
+      path: '/reporting/reports',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Amazon-Advertising-API-ClientId': process.env.ADS_CLIENT_ID || process.env.LWA_CLIENT_ID,
+        'Amazon-Advertising-API-Scope': profileId,
+        'Content-Type': 'application/vnd.createasyncreportrequest.v3+json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          console.error('Failed to parse report response:', data);
+          resolve({ reportId: null });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+
+  if (!reportResponse.reportId) {
+    console.log('No search term report ID returned. Response:', JSON.stringify(reportResponse));
+    return [];
+  }
+
+  console.log(`Report ID: ${reportResponse.reportId}, polling for completion...`);
+
+  // Poll for report completion using v3 API
+  const reportData = await downloadReportV3(accessToken, profileId, reportResponse.reportId);
+
+  // Transform the data to our format
+  return reportData.map(r => ({
+    date: r.date,
+    query: r.searchTerm,
+    campaignId: r.campaignId,
+    impressions: r.impressions || 0,
+    clicks: r.clicks || 0,
+    spend: r.cost || 0,
+    sales: r.sales14d || 0,
+    orders: r.purchases14d || 0,
+  }));
+}
+
+// Download report using v3 reporting API
+async function downloadReportV3(accessToken, profileId, reportId, maxRetries = 30) {
+  const https = require('https');
+  const zlib = require('zlib');
+
+  for (let i = 0; i < maxRetries; i++) {
+    // Check report status
+    const status = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'advertising-api-eu.amazon.com',
+        path: `/reporting/reports/${reportId}`,
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Amazon-Advertising-API-ClientId': process.env.ADS_CLIENT_ID || process.env.LWA_CLIENT_ID,
+          'Amazon-Advertising-API-Scope': profileId,
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            resolve({ status: 'FAILURE' });
+          }
+        });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+
+    if (status.status === 'COMPLETED' && status.url) {
+      console.log('Report ready, downloading...');
+      // Download the report
+      const reportData = await new Promise((resolve, reject) => {
+        https.get(status.url, (res) => {
+          const chunks = [];
+          res.on('data', chunk => chunks.push(chunk));
+          res.on('end', () => {
+            const buffer = Buffer.concat(chunks);
+            // Try to decompress if gzipped
+            try {
+              const decompressed = zlib.gunzipSync(buffer);
+              resolve(JSON.parse(decompressed.toString()));
+            } catch (e) {
+              // Not gzipped, parse directly
+              try {
+                resolve(JSON.parse(buffer.toString()));
+              } catch (e2) {
+                resolve([]);
+              }
+            }
+          });
+        }).on('error', reject);
+      });
+
+      return reportData;
+    }
+
+    if (status.status === 'FAILURE') {
+      console.log('Report generation failed:', status.failureReason || 'unknown');
+      return [];
+    }
+
+    // Log progress every 3 attempts
+    if (i % 3 === 0) {
+      console.log(`  Report status: ${status.status}, attempt ${i+1}/${maxRetries}...`);
+    }
+
+    // Wait before retrying (longer wait for reports which can be slow)
+    await new Promise(r => setTimeout(r, 6000));
+  }
+
+  console.log('Report download timed out');
+  return [];
 }
 
 // Fetch SP product targeting report data
@@ -1029,12 +1644,14 @@ async function updateSyncTime() {
 async function main() {
   console.log('Amazon Brain - Data Sync');
   console.log('========================');
+  console.log(`Date range: ${syncDaysBack} days back`);
 
   // Sync products first to populate brand cache
   if (syncProducts) await syncProductsData();
   if (syncOrders) await syncOrdersData();
   if (syncAds) await syncAdsData();
   if (syncTargeting) await syncTargetingData();
+  if (syncSearchTerms) await syncSearchTermsData();
   // Legacy inventory sync (deprecated, use --products instead)
   if (syncInventory) {
     console.log('\n⚠️  --inventory is deprecated. Use --products instead.');

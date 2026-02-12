@@ -31,13 +31,14 @@ interface WeekComparisonChartProps {
 }
 
 // Custom tick component to show event badges
-function CustomXAxisTick(props: {
-  x: number;
-  y: number;
-  payload: { value: string };
-  dataWithEvents?: WeekData[];
-}) {
-  const { x, y, payload, dataWithEvents } = props;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function CustomXAxisTick(props: any) {
+  const { x, y, payload, dataWithEvents } = props as {
+    x: number;
+    y: number;
+    payload: { value: string };
+    dataWithEvents?: WeekData[];
+  };
   const weekData = dataWithEvents?.find((d) => d.week === payload.value);
   const events = weekData?.events || [];
   const hasHighImpact = events.some((e) => e.impact_level === "high");
