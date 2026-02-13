@@ -112,7 +112,8 @@ CREATE TABLE searchterm_week (
   spend DECIMAL(10,2) NOT NULL DEFAULT 0,
   sales DECIMAL(12,2) NOT NULL DEFAULT 0,
   acos DECIMAL(5,2) NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(term, campaign_id, week_start)
 );
 
 -- Decisions log (mode changes, etc.)

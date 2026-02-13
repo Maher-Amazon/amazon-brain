@@ -854,6 +854,217 @@ async function syncCampaignPerformance(accessToken, profileId) {
   }
 
   console.log(`Updated ${aggregates.length} brand-week records with ad performance data`);
+
+  // Also sync SKU-level ad data
+  await syncSkuAdPerformance(accessToken, profileId);
+}
+
+// Sync SKU-level ad performance data to sku_week
+async function syncSkuAdPerformance(accessToken, profileId) {
+  console.log('\nFetching SKU-level ad performance data...');
+
+  const maxAdsDays = Math.min(syncDaysBack, 60);
+  const chunkSize = 7;
+
+  let allSkuAdData = [];
+
+  // Fetch in 7-day chunks
+  for (let daysBack = 0; daysBack < maxAdsDays; daysBack += chunkSize) {
+    const chunkEnd = new Date();
+    chunkEnd.setDate(chunkEnd.getDate() - daysBack);
+
+    const chunkStart = new Date();
+    chunkStart.setDate(chunkStart.getDate() - Math.min(daysBack + chunkSize, maxAdsDays));
+
+    if (chunkStart >= chunkEnd) break;
+
+    console.log(`  Requesting SKU ad data: ${chunkStart.toISOString().split('T')[0]} to ${chunkEnd.toISOString().split('T')[0]}`);
+
+    const chunkData = await fetchSkuAdReport(accessToken, profileId, chunkStart, chunkEnd);
+    allSkuAdData = allSkuAdData.concat(chunkData);
+  }
+
+  console.log(`Found ${allSkuAdData.length} SKU ad performance records`);
+
+  if (allSkuAdData.length === 0) {
+    console.log('No SKU ad data to aggregate');
+    return;
+  }
+
+  // Get SKU mappings from database (ASIN -> sku_id)
+  const { data: skus } = await supabase.from('skus').select('id, asin');
+  const asinToSkuId = {};
+  for (const sku of skus || []) {
+    asinToSkuId[sku.asin] = sku.id;
+  }
+
+  // Aggregate by SKU and week
+  const skuWeekAggregates = {}; // { `${skuId}-${weekStart}` -> { spend, sales } }
+
+  let unmappedCount = 0;
+  for (const record of allSkuAdData) {
+    const skuId = asinToSkuId[record.asin];
+    if (!skuId) {
+      unmappedCount++;
+      continue;
+    }
+
+    const recordDate = record.date ? new Date(record.date) : new Date();
+    const weekStart = getWeekStart(recordDate).toISOString().split('T')[0];
+    const key = `${skuId}-${weekStart}`;
+
+    if (!skuWeekAggregates[key]) {
+      skuWeekAggregates[key] = {
+        sku_id: skuId,
+        week_start: weekStart,
+        ad_spend: 0,
+        ad_sales: 0,
+        impressions: 0,
+        clicks: 0,
+      };
+    }
+
+    skuWeekAggregates[key].ad_spend += record.spend || 0;
+    skuWeekAggregates[key].ad_sales += record.sales || 0;
+    skuWeekAggregates[key].impressions += record.impressions || 0;
+    skuWeekAggregates[key].clicks += record.clicks || 0;
+  }
+
+  if (unmappedCount > 0) {
+    console.log(`  ${unmappedCount} records with unmapped ASINs (not in skus table)`);
+  }
+
+  // Update sku_week with ad metrics
+  const aggregates = Object.values(skuWeekAggregates);
+  console.log(`Updating ${aggregates.length} SKU-week records with ad metrics...`);
+
+  let updated = 0;
+  for (const agg of aggregates) {
+    // First get existing revenue to calculate TACoS
+    const { data: existing } = await supabase
+      .from('sku_week')
+      .select('id, revenue')
+      .eq('sku_id', agg.sku_id)
+      .eq('week_start', agg.week_start)
+      .single();
+
+    const revenue = existing?.revenue || 0;
+    const tacos = revenue > 0 ? (agg.ad_spend / revenue) * 100 : 0;
+    const acos = agg.ad_sales > 0 ? (agg.ad_spend / agg.ad_sales) * 100 : 0;
+
+    if (existing) {
+      // Update existing record
+      const { error } = await supabase
+        .from('sku_week')
+        .update({
+          ad_spend: agg.ad_spend,
+          ad_sales: agg.ad_sales,
+          tacos: tacos,
+          acos: acos,
+        })
+        .eq('sku_id', agg.sku_id)
+        .eq('week_start', agg.week_start);
+
+      if (!error) updated++;
+    } else {
+      // Create new record if it doesn't exist
+      const { error } = await supabase.from('sku_week').upsert({
+        sku_id: agg.sku_id,
+        week_start: agg.week_start,
+        ad_spend: agg.ad_spend,
+        ad_sales: agg.ad_sales,
+        tacos: tacos,
+        acos: acos,
+      }, { onConflict: 'sku_id,week_start' });
+
+      if (!error) updated++;
+    }
+  }
+
+  console.log(`Updated ${updated} SKU-week records with ad data`);
+}
+
+// Fetch SKU-level ad report (Advertised Product report)
+async function fetchSkuAdReport(accessToken, profileId, startDate, endDate) {
+  const https = require('https');
+
+  const formatDate = (d) => d.toISOString().split('T')[0];
+
+  // Request SP Advertised Product report
+  const reportRequest = {
+    name: 'SP Advertised Product Report',
+    startDate: formatDate(startDate),
+    endDate: formatDate(endDate),
+    configuration: {
+      adProduct: 'SPONSORED_PRODUCTS',
+      groupBy: ['advertiser'],
+      columns: [
+        'date',
+        'advertisedAsin',
+        'advertisedSku',
+        'campaignId',
+        'impressions',
+        'clicks',
+        'cost',
+        'sales14d',
+        'purchases14d',
+      ],
+      reportTypeId: 'spAdvertisedProduct',
+      timeUnit: 'DAILY',
+      format: 'GZIP_JSON',
+    },
+  };
+
+  const reportResponse = await new Promise((resolve, reject) => {
+    const postData = JSON.stringify(reportRequest);
+    const req = https.request({
+      hostname: 'advertising-api-eu.amazon.com',
+      path: '/reporting/reports',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Amazon-Advertising-API-ClientId': process.env.ADS_CLIENT_ID || process.env.LWA_CLIENT_ID,
+        'Amazon-Advertising-API-Scope': profileId,
+        'Content-Type': 'application/vnd.createasyncreportrequest.v3+json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          resolve({ reportId: null });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+
+  if (!reportResponse.reportId) {
+    console.log('    No SKU ad report ID returned. Response:', JSON.stringify(reportResponse));
+    return [];
+  }
+
+  console.log(`    SKU Ad Report ID: ${reportResponse.reportId}, polling...`);
+
+  const reportData = await downloadReportV3(accessToken, profileId, reportResponse.reportId, 90);
+
+  // Transform to our format
+  return reportData.map(r => ({
+    date: r.date,
+    asin: r.advertisedAsin,
+    sku: r.advertisedSku,
+    campaignId: r.campaignId,
+    impressions: r.impressions || 0,
+    clicks: r.clicks || 0,
+    spend: r.cost || 0,
+    sales: r.sales14d || 0,
+    orders: r.purchases14d || 0,
+  }));
 }
 
 // Fetch campaign performance report from Ads API
@@ -952,91 +1163,114 @@ async function syncTargetingData() {
       return;
     }
 
-    const weekStart = getWeekStart(new Date()).toISOString().split('T')[0];
     const brandId = await getOrCreateBrand('Default');
 
-    // Get SP product targeting report
-    console.log('Fetching SP product targeting data...');
-    const spTargetingData = await fetchSpTargetingReport(accessToken, profileId);
-    console.log(`Found ${spTargetingData.length} SP targeting records`);
+    // Use 14-day chunks like search terms (v3 API with date ranges)
+    const maxAdsDays = Math.min(syncDaysBack, 60);
+    const chunkSize = 14;
 
-    // Get SD matched targets report
-    console.log('Fetching SD matched targets data...');
-    const sdTargetingData = await fetchSdTargetingReport(accessToken, profileId);
-    console.log(`Found ${sdTargetingData.length} SD targeting records`);
+    let allSpTargetingData = [];
+    let allSdTargetingData = [];
 
-    // Process SP targeting data
-    for (const target of spTargetingData) {
-      if (!target.targetAsin) continue;
+    // Fetch in 14-day chunks
+    for (let daysBack = 0; daysBack < maxAdsDays; daysBack += chunkSize) {
+      const chunkEnd = new Date();
+      chunkEnd.setDate(chunkEnd.getDate() - daysBack);
 
-      // Get campaign ID from our database
-      let campaignId = null;
-      if (target.campaignId) {
-        const { data: campaign } = await supabase
-          .from('campaigns')
-          .select('id')
-          .eq('campaign_id', target.campaignId)
-          .single();
-        campaignId = campaign?.id;
-      }
+      const chunkStart = new Date();
+      chunkStart.setDate(chunkStart.getDate() - Math.min(daysBack + chunkSize, maxAdsDays));
 
-      const acos = target.sales > 0 ? (target.spend / target.sales) * 100 : 0;
+      if (chunkStart >= chunkEnd) break;
 
-      const { error } = await supabase.from('target_asin_week').upsert({
-        target_asin: target.targetAsin,
-        campaign_id: campaignId,
-        brand_id: brandId,
-        ad_type: 'SP',
-        week_start: weekStart,
-        impressions: target.impressions || 0,
-        clicks: target.clicks || 0,
-        spend: target.spend || 0,
-        sales: target.sales || 0,
-        orders: target.orders || 0,
-        acos: acos,
-      }, { onConflict: 'target_asin,campaign_id,ad_type,week_start' });
+      console.log(`  Requesting targeting data: ${chunkStart.toISOString().split('T')[0]} to ${chunkEnd.toISOString().split('T')[0]}`);
 
-      if (error) {
-        console.error('Error upserting SP target ASIN:', error);
-      }
+      // Fetch SP and SD targeting in parallel for this chunk
+      const [spChunkData, sdChunkData] = await Promise.all([
+        fetchSpTargetingReport(accessToken, profileId, chunkStart, chunkEnd),
+        fetchSdTargetingReport(accessToken, profileId, chunkStart, chunkEnd),
+      ]);
+
+      allSpTargetingData = allSpTargetingData.concat(spChunkData);
+      allSdTargetingData = allSdTargetingData.concat(sdChunkData);
     }
 
-    // Process SD targeting data
-    for (const target of sdTargetingData) {
-      if (!target.targetAsin) continue;
+    console.log(`Found ${allSpTargetingData.length} SP targeting records total`);
+    console.log(`Found ${allSdTargetingData.length} SD targeting records total`);
 
-      let campaignId = null;
-      if (target.campaignId) {
-        const { data: campaign } = await supabase
-          .from('campaigns')
-          .select('id')
-          .eq('campaign_id', target.campaignId)
-          .single();
-        campaignId = campaign?.id;
+    // Aggregate by week and upsert
+    const processTargetingData = async (targetingData, adType) => {
+      // Aggregate by week, target ASIN, and campaign
+      const weekAggregates = {}; // { `${weekStart}|${targetAsin}|${campaignId}` -> data }
+
+      for (const target of targetingData) {
+        if (!target.targetAsin) continue;
+
+        const recordDate = target.date ? new Date(target.date) : new Date();
+        const weekStart = getWeekStart(recordDate).toISOString().split('T')[0];
+        const key = `${weekStart}|${target.targetAsin}|${target.campaignId || 'unknown'}`;
+
+        if (!weekAggregates[key]) {
+          weekAggregates[key] = {
+            weekStart,
+            targetAsin: target.targetAsin,
+            campaignId: target.campaignId,
+            impressions: 0,
+            clicks: 0,
+            spend: 0,
+            sales: 0,
+            orders: 0,
+          };
+        }
+
+        weekAggregates[key].impressions += target.impressions || 0;
+        weekAggregates[key].clicks += target.clicks || 0;
+        weekAggregates[key].spend += target.spend || 0;
+        weekAggregates[key].sales += target.sales || 0;
+        weekAggregates[key].orders += target.orders || 0;
       }
 
-      const acos = target.sales > 0 ? (target.spend / target.sales) * 100 : 0;
+      // Upsert aggregated data
+      let upserted = 0;
+      for (const data of Object.values(weekAggregates)) {
+        let campaignId = null;
+        if (data.campaignId) {
+          const { data: campaign } = await supabase
+            .from('campaigns')
+            .select('id')
+            .eq('campaign_id', data.campaignId)
+            .single();
+          campaignId = campaign?.id;
+        }
 
-      const { error } = await supabase.from('target_asin_week').upsert({
-        target_asin: target.targetAsin,
-        campaign_id: campaignId,
-        brand_id: brandId,
-        ad_type: 'SD',
-        week_start: weekStart,
-        impressions: target.impressions || 0,
-        clicks: target.clicks || 0,
-        spend: target.spend || 0,
-        sales: target.sales || 0,
-        orders: target.orders || 0,
-        acos: acos,
-      }, { onConflict: 'target_asin,campaign_id,ad_type,week_start' });
+        const acos = data.sales > 0 ? (data.spend / data.sales) * 100 : 0;
 
-      if (error) {
-        console.error('Error upserting SD target ASIN:', error);
+        const { error } = await supabase.from('target_asin_week').upsert({
+          target_asin: data.targetAsin,
+          campaign_id: campaignId,
+          brand_id: brandId,
+          ad_type: adType,
+          week_start: data.weekStart,
+          impressions: data.impressions,
+          clicks: data.clicks,
+          spend: data.spend,
+          sales: data.sales,
+          orders: data.orders,
+          acos: acos,
+        }, { onConflict: 'target_asin,campaign_id,ad_type,week_start' });
+
+        if (error) {
+          console.error(`Error upserting ${adType} target ASIN:`, error);
+        } else {
+          upserted++;
+        }
       }
-    }
+      return upserted;
+    };
 
-    console.log(`Synced ${spTargetingData.length + sdTargetingData.length} targeting records`);
+    const spUpserted = await processTargetingData(allSpTargetingData, 'SP');
+    const sdUpserted = await processTargetingData(allSdTargetingData, 'SD');
+
+    console.log(`Synced ${spUpserted} SP + ${sdUpserted} SD = ${spUpserted + sdUpserted} targeting records`);
   } catch (error) {
     console.error('Error syncing targeting data:', error.message);
   }
@@ -1059,12 +1293,12 @@ async function syncSearchTermsData() {
       return;
     }
 
-    // Amazon Ads API allows up to 31 days per request for search term reports
-    const maxAdsDays = Math.min(syncDaysBack, 60); // Still aim for 60 days max
-    console.log(`Fetching search term data for the last ${maxAdsDays} days (31-day chunks)...`);
+    // Fetch search term data in 14-day chunks (31-day chunks were timing out)
+    const maxAdsDays = Math.min(syncDaysBack, 60);
+    console.log(`Fetching search term data for the last ${maxAdsDays} days (14-day chunks)...`);
 
-    // Fetch in 31-day chunks (API limit)
-    const chunkSize = 31;
+    // Fetch in 14-day chunks (31-day chunks were timing out)
+    const chunkSize = 14;
     let allSearchTermData = [];
     const endDate = new Date();
 
@@ -1257,8 +1491,8 @@ async function fetchSpSearchTermReport(accessToken, profileId, startDate, endDat
 
   console.log(`Report ID: ${reportResponse.reportId}, polling for completion...`);
 
-  // Poll for report completion using v3 API
-  const reportData = await downloadReportV3(accessToken, profileId, reportResponse.reportId);
+  // Poll for report completion using v3 API with extended retries (search term reports are slow)
+  const reportData = await downloadReportV3(accessToken, profileId, reportResponse.reportId, 90);
 
   // Transform the data to our format
   return reportData.map(r => ({
@@ -1351,26 +1585,49 @@ async function downloadReportV3(accessToken, profileId, reportId, maxRetries = 3
   return [];
 }
 
-// Fetch SP product targeting report data
-async function fetchSpTargetingReport(accessToken, profileId) {
+// Fetch SP product targeting report data using v3 API
+async function fetchSpTargetingReport(accessToken, profileId, startDate, endDate) {
   const https = require('https');
 
-  // Request report
-  const reportResponse = await new Promise((resolve, reject) => {
-    const postData = JSON.stringify({
-      reportDate: new Date().toISOString().split('T')[0],
-      metrics: ['impressions', 'clicks', 'cost', 'sales14d', 'purchases14d'],
-    });
+  const formatDate = (d) => d.toISOString().split('T')[0];
 
+  // Request report using v3 API with date range
+  // Note: v3 API uses 'targeting' column instead of 'targetingExpression'
+  const reportRequest = {
+    name: 'SP Targeting Report',
+    startDate: formatDate(startDate),
+    endDate: formatDate(endDate),
+    configuration: {
+      adProduct: 'SPONSORED_PRODUCTS',
+      groupBy: ['targeting'],
+      columns: [
+        'date',
+        'campaignId',
+        'campaignName',
+        'targeting',
+        'impressions',
+        'clicks',
+        'cost',
+        'sales14d',
+        'purchases14d',
+      ],
+      reportTypeId: 'spTargeting',
+      timeUnit: 'DAILY',
+      format: 'GZIP_JSON',
+    },
+  };
+
+  const reportResponse = await new Promise((resolve, reject) => {
+    const postData = JSON.stringify(reportRequest);
     const req = https.request({
       hostname: 'advertising-api-eu.amazon.com',
-      path: '/v2/sp/targets/report',
+      path: '/reporting/reports',
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Amazon-Advertising-API-ClientId': process.env.ADS_CLIENT_ID || process.env.LWA_CLIENT_ID,
         'Amazon-Advertising-API-Scope': profileId,
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/vnd.createasyncreportrequest.v3+json',
         'Content-Length': Buffer.byteLength(postData),
       },
     }, (res) => {
@@ -1390,19 +1647,24 @@ async function fetchSpTargetingReport(accessToken, profileId) {
   });
 
   if (!reportResponse.reportId) {
-    console.log('No SP targeting report available');
+    console.log('    No SP targeting report ID returned. Response:', JSON.stringify(reportResponse));
     return [];
   }
 
-  // Poll for report completion and download
-  const reportData = await downloadReport(accessToken, profileId, reportResponse.reportId);
+  console.log(`    SP Targeting Report ID: ${reportResponse.reportId}, polling...`);
+
+  // Poll for report completion using v3 API
+  const reportData = await downloadReportV3(accessToken, profileId, reportResponse.reportId, 90);
 
   // Parse and filter for ASIN targets only
+  // v3 API returns 'targeting' column instead of 'targetingExpression'
   return reportData
-    .filter(r => r.targetingExpression && r.targetingExpression.includes('asin='))
+    .filter(r => r.targeting && r.targeting.includes('asin'))
     .map(r => {
-      const asinMatch = r.targetingExpression.match(/asin="([A-Z0-9]+)"/);
+      // Handle different ASIN expression formats (e.g., asin="B0123XYZ" or asin=B0123XYZ)
+      const asinMatch = r.targeting.match(/asin[=:]"?([A-Z0-9]+)"?/i);
       return {
+        date: r.date,
         targetAsin: asinMatch ? asinMatch[1] : null,
         campaignId: r.campaignId,
         impressions: r.impressions || 0,
@@ -1415,26 +1677,49 @@ async function fetchSpTargetingReport(accessToken, profileId) {
     .filter(r => r.targetAsin);
 }
 
-// Fetch SD matched targets report data
-async function fetchSdTargetingReport(accessToken, profileId) {
+// Fetch SD matched targets report data using v3 API
+async function fetchSdTargetingReport(accessToken, profileId, startDate, endDate) {
   const https = require('https');
 
-  const reportResponse = await new Promise((resolve, reject) => {
-    const postData = JSON.stringify({
-      reportDate: new Date().toISOString().split('T')[0],
-      metrics: ['impressions', 'clicks', 'cost', 'sales', 'purchases'],
-      tactic: 'T00020', // Product targeting tactic
-    });
+  const formatDate = (d) => d.toISOString().split('T')[0];
 
+  // Request report using v3 API with date range
+  // Note: v3 API uses 'targetingId' and 'targetingExpression' (not 'targetId')
+  const reportRequest = {
+    name: 'SD Targeting Report',
+    startDate: formatDate(startDate),
+    endDate: formatDate(endDate),
+    configuration: {
+      adProduct: 'SPONSORED_DISPLAY',
+      groupBy: ['targeting'],
+      columns: [
+        'date',
+        'campaignId',
+        'campaignName',
+        'targetingExpression',
+        'impressions',
+        'clicks',
+        'cost',
+        'sales',
+        'purchases',
+      ],
+      reportTypeId: 'sdTargeting',
+      timeUnit: 'DAILY',
+      format: 'GZIP_JSON',
+    },
+  };
+
+  const reportResponse = await new Promise((resolve, reject) => {
+    const postData = JSON.stringify(reportRequest);
     const req = https.request({
       hostname: 'advertising-api-eu.amazon.com',
-      path: '/sd/targets/report',
+      path: '/reporting/reports',
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Amazon-Advertising-API-ClientId': process.env.ADS_CLIENT_ID || process.env.LWA_CLIENT_ID,
         'Amazon-Advertising-API-Scope': profileId,
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/vnd.createasyncreportrequest.v3+json',
         'Content-Length': Buffer.byteLength(postData),
       },
     }, (res) => {
@@ -1454,17 +1739,22 @@ async function fetchSdTargetingReport(accessToken, profileId) {
   });
 
   if (!reportResponse.reportId) {
-    console.log('No SD targeting report available');
+    console.log('    No SD targeting report ID returned. Response:', JSON.stringify(reportResponse));
     return [];
   }
 
-  const reportData = await downloadReport(accessToken, profileId, reportResponse.reportId);
+  console.log(`    SD Targeting Report ID: ${reportResponse.reportId}, polling...`);
+
+  // Poll for report completion using v3 API
+  const reportData = await downloadReportV3(accessToken, profileId, reportResponse.reportId, 90);
 
   return reportData
     .filter(r => r.targetingExpression && r.targetingExpression.includes('asin'))
     .map(r => {
-      const asinMatch = r.targetingExpression.match(/asin="([A-Z0-9]+)"/);
+      // Handle different ASIN expression formats
+      const asinMatch = r.targetingExpression.match(/asin[=:]"?([A-Z0-9]+)"?/i);
       return {
+        date: r.date,
         targetAsin: asinMatch ? asinMatch[1] : null,
         campaignId: r.campaignId,
         impressions: r.impressions || 0,
