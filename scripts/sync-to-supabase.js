@@ -921,6 +921,7 @@ async function syncSkuAdPerformance(accessToken, profileId) {
         ad_sales: 0,
         impressions: 0,
         clicks: 0,
+        ad_orders: 0,
       };
     }
 
@@ -928,6 +929,7 @@ async function syncSkuAdPerformance(accessToken, profileId) {
     skuWeekAggregates[key].ad_sales += record.sales || 0;
     skuWeekAggregates[key].impressions += record.impressions || 0;
     skuWeekAggregates[key].clicks += record.clicks || 0;
+    skuWeekAggregates[key].ad_orders += record.orders || 0;
   }
 
   if (unmappedCount > 0) {
@@ -952,6 +954,11 @@ async function syncSkuAdPerformance(accessToken, profileId) {
     const tacos = revenue > 0 ? (agg.ad_spend / revenue) * 100 : 0;
     const acos = agg.ad_sales > 0 ? (agg.ad_spend / agg.ad_sales) * 100 : 0;
 
+    // Calculate derived metrics
+    const ctr = agg.impressions > 0 ? (agg.clicks / agg.impressions) * 100 : 0;
+    const cpc = agg.clicks > 0 ? agg.ad_spend / agg.clicks : 0;
+    const cvr = agg.clicks > 0 ? (agg.ad_orders / agg.clicks) * 100 : 0;
+
     if (existing) {
       // Update existing record
       const { error } = await supabase
@@ -959,8 +966,14 @@ async function syncSkuAdPerformance(accessToken, profileId) {
         .update({
           ad_spend: agg.ad_spend,
           ad_sales: agg.ad_sales,
+          impressions: agg.impressions,
+          clicks: agg.clicks,
+          ad_orders: agg.ad_orders,
           tacos: tacos,
           acos: acos,
+          ctr: ctr,
+          cpc: cpc,
+          cvr: cvr,
         })
         .eq('sku_id', agg.sku_id)
         .eq('week_start', agg.week_start);
@@ -973,8 +986,14 @@ async function syncSkuAdPerformance(accessToken, profileId) {
         week_start: agg.week_start,
         ad_spend: agg.ad_spend,
         ad_sales: agg.ad_sales,
+        impressions: agg.impressions,
+        clicks: agg.clicks,
+        ad_orders: agg.ad_orders,
         tacos: tacos,
         acos: acos,
+        ctr: ctr,
+        cpc: cpc,
+        cvr: cvr,
       }, { onConflict: 'sku_id,week_start' });
 
       if (!error) updated++;
